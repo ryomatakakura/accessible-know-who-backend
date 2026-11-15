@@ -1,0 +1,8 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+gunicorn==23.0.0
+pydantic==2.10.4
+SQLAlchemy==2.0.36
+PyMySQL==1.1.1
+cryptography==43.0.3
+azure-monitor-opentelemetry==1.6.4

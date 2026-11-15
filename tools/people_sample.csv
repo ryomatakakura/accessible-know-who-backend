@@ -1,0 +1,4 @@
+email,name,department,title,admin,skills
+sato.ichiro@example.co.jp,佐藤 一郎,営業企画部,部長,1,中期経営計画;予算策定
+suzuki.hana@example.co.jp,鈴木 花,営業企画部,メンバー,0,非対面サービスの審査;コンプライアンス
+takahashi.ken@example.co.jp,高橋 健,デジタル戦略部,リーダー,0,生成AI活用;データ分析
