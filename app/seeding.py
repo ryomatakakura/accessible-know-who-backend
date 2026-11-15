@@ -1,5 +1,6 @@
 """テーブル作成と初期データ投入。複数ワーカーが同時に起動しても二重に入らないようにする。"""
 import logging
+from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, select, text
@@ -8,7 +9,8 @@ from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from . import seed_data as S
 from .config import settings
 from .db import Base, SessionLocal, engine
-from .models import AuditLog, Consultation, Department, Expertise, Floor, Person, Presence, Reservation, Room, RoomBooking, Seat
+from .models import (AuditLog, Consultation, ConsultationMemo, ConsultationRequest, Department, Expertise, Floor, Person, Preference, Presence,
+                     Reservation, Room, RoomBooking, Seat)
 from .timeutil import today
 
 log = logging.getLogger(__name__)
@@ -52,6 +54,18 @@ def _insert_dynamic(db):
     db.add_all(Reservation(**r) for r in rsv)
     db.add_all(RoomBooking(**b) for b in bks)
     db.add_all(Consultation(**c) for c in cons)
+    for r in S.requests(today(), ZoneInfo(settings.timezone)):
+        memo = r.pop("memo", None)
+        req = ConsultationRequest(**r)
+        db.add(req)
+        if memo:
+            db.flush()
+            approved = memo["status"] == "approved"
+            db.add(ConsultationMemo(request_id=req.id, **memo, approved_at=r["started_at"] + timedelta(days=1) if approved else None))
+
+
+# 日付に合わせて作り直すもの（消す順。メモ → 依頼 の順に消す）
+DAILY = (ConsultationMemo, ConsultationRequest, Presence, Reservation, RoomBooking, Consultation)
 
 
 def init_db(seed: bool = True) -> None:
@@ -67,9 +81,11 @@ def init_db(seed: bool = True) -> None:
                 if not db.scalar(select(Department.id).limit(1)):
                     _insert_static(db)
                     db.flush()
+                if not db.scalar(select(Preference.person_id).limit(1)):  # 本人が変えた設定は、日をまたいでも消さない
+                    db.add_all(Preference(**p) for p in S.PREFS)
                 # デモ：その日のデータがなければ作る（翌日に起動し直しても画面が空にならない）
                 if not db.scalar(select(Presence.id).where(Presence.day == today()).limit(1)):
-                    for model in (Presence, Reservation, RoomBooking, Consultation):
+                    for model in DAILY:
                         db.execute(delete(model))
                     db.execute(delete(Expertise).where(Expertise.learned.is_(True)))
                     _insert_dynamic(db)
@@ -83,7 +99,7 @@ def init_db(seed: bool = True) -> None:
 def reset_demo() -> None:
     def run():
         with SessionLocal() as db:
-            for model in (Presence, Reservation, RoomBooking, Consultation, AuditLog):
+            for model in (*DAILY, AuditLog):
                 db.execute(delete(model))
             db.execute(delete(Expertise).where(Expertise.learned.is_(True)))
             _insert_dynamic(db)

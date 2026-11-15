@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -18,11 +18,13 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
+from . import knowwho as kw
 from . import services as svc
 from .auth import current_user, require_admin
 from .config import settings
 from .db import get_db, lock_row
-from .models import Consultation, Expertise, Floor, Person, Presence, Reservation, Room, RoomBooking, Seat
+from .models import (Consultation, ConsultationMemo, ConsultationRequest, Expertise, Floor, Person, Preference, Presence, Reservation, Room,
+                     RoomBooking, Seat)
 from .seed_data import STATUSES, TOPICS, match_topics
 from .seeding import init_db, reset_demo
 from .timeutil import hhmm_now, today
@@ -43,7 +45,7 @@ async def lifespan(_app):
     yield
 
 
-app = FastAPI(title="座席管理 API", version="1.0.0", lifespan=lifespan,
+app = FastAPI(title="会いに行ける Know-Who API", version="1.0.0", lifespan=lifespan,
               docs_url="/api/docs" if settings.is_demo else None, redoc_url=None,
               openapi_url="/api/openapi.json" if settings.is_demo else None)
 if settings.allowed_origins:
@@ -123,6 +125,71 @@ class StatusIn(BaseModel):
     status: Literal["remote", "trip", "out", "leave", "none"]
 
 
+def _filled(v: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError("空欄のままでは送れません")
+    return v
+
+
+class SlotIn(BaseModel):
+    day: str
+    start: str
+
+    @field_validator("start")
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        if not HHMM.match(v):
+            raise ValueError("時刻は HH:MM で指定してください")
+        return v
+
+
+class RequestIn(BaseModel):
+    expert_id: str
+    topic: str = Field(min_length=1, max_length=60)
+    purpose: str = Field(min_length=1, max_length=300)    # 知りたいこと
+    viewpoint: str = Field(min_length=1, max_length=200)  # 観点
+    message: str = Field(min_length=1, max_length=2000)   # 依頼文（テンプレートから作って本人が直せる）
+    slots: list[SlotIn] = Field(min_length=1, max_length=3)
+    duration: Literal[15, 30] = 30
+    _strip = field_validator("topic", "purpose", "viewpoint", "message")(_filled)
+
+
+class AcceptIn(BaseModel):
+    slot: int = Field(ge=0, le=2)
+    mode: Literal["office", "online"] = "office"
+
+
+class DeclineIn(BaseModel):
+    reason: str | None = None
+
+
+class SeatIn(BaseModel):
+    seat_id: str
+
+
+class StartIn(BaseModel):
+    online: bool = False
+
+
+class FinishIn(BaseModel):
+    helpful: bool | None = None
+
+
+class MemoIn(BaseModel):
+    heard: str = Field(min_length=1, max_length=2000)    # 聞いたこと
+    learned: str = Field(min_length=1, max_length=2000)  # 分かったこと
+    reuse: str = Field(min_length=1, max_length=2000)    # 次に使える形
+    helpful: bool | None = None
+    _strip = field_validator("heard", "learned", "reuse")(_filled)
+
+
+class PrefIn(BaseModel):
+    opt_in: bool
+    scope: Literal["all", "dept", "private"]
+    notify: bool = True
+
+
 # ---------- 参照 ----------
 @app.get("/api/health")
 def health(db: Session = Depends(get_db)):
@@ -135,7 +202,8 @@ def me(user: Person = Depends(current_user), db: Session = Depends(get_db)):
     ctx = svc.Ctx(db)
     return {"user": ctx.person(user.id), "mode": "demo" if settings.is_demo else "sso", "tenant": settings.tenant_name,
             "today": today().isoformat(), "now": hhmm_now(), "timezone": settings.timezone, "statuses": STATUSES,
-            "hours": [settings.open_hour, settings.close_hour], "book_ahead_days": settings.book_ahead_days, "topics": list(TOPICS)}
+            "hours": [settings.open_hour, settings.close_hour], "book_ahead_days": settings.book_ahead_days, "topics": list(TOPICS),
+            "prefs": ctx.pref(user.id), "decline_reasons": kw.DECLINE_REASONS}
 
 
 @app.get("/api/users")
@@ -160,13 +228,13 @@ def floors(_: Person = Depends(current_user), db: Session = Depends(get_db)):
 
 @app.get("/api/state")
 def state(floor: str, day: str | None = None, user: Person = Depends(current_user), db: Session = Depends(get_db)):
-    ctx = svc.Ctx(db)
+    ctx = svc.Ctx(db, user)
     return svc.floor_state(db, ctx, floor, svc.parse_day(day), user)
 
 
 @app.get("/api/seats/{sid}")
-def seat(sid: str, day: str | None = None, _: Person = Depends(current_user), db: Session = Depends(get_db)):
-    return svc.seat_detail(db, svc.Ctx(db), sid, svc.parse_day(day))
+def seat(sid: str, day: str | None = None, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    return svc.seat_detail(db, svc.Ctx(db, user), sid, svc.parse_day(day))
 
 
 @app.get("/api/search")
@@ -174,7 +242,7 @@ def search(q: str = "", user: Person = Depends(current_user), db: Session = Depe
     q = q.strip()[:50]
     if not q:
         return {"people": [], "seats": [], "rooms": []}
-    ctx = svc.Ctx(db)
+    ctx = svc.Ctx(db, user)
     t = today()
     pres, rsv = svc.presences(db, t), svc.reservations_on(db, t)
     key = q.replace(" ", "").replace("　", "").lower()
@@ -190,8 +258,8 @@ def search(q: str = "", user: Person = Depends(current_user), db: Session = Depe
 
 
 @app.get("/api/people")
-def people(dept: str | None = None, day: str | None = None, _: Person = Depends(current_user), db: Session = Depends(get_db)):
-    ctx = svc.Ctx(db)
+def people(dept: str | None = None, day: str | None = None, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    ctx = svc.Ctx(db, user)
     d = svc.parse_day(day)
     pres = svc.presences(db, d) if d == today() else {}
     rsv = svc.reservations_on(db, d)
@@ -201,7 +269,7 @@ def people(dept: str | None = None, day: str | None = None, _: Person = Depends(
 
 @app.get("/api/recommend")
 def recommend(q: str = "", day: str | None = None, user: Person = Depends(current_user), db: Session = Depends(get_db)):
-    return svc.recommend(db, svc.Ctx(db), q.strip()[:100], svc.parse_day(day), user)
+    return svc.recommend(db, svc.Ctx(db, user), q.strip()[:100], svc.parse_day(day), user)
 
 
 def _near(db: Session, user: Person, body: Purpose) -> tuple[str | None, str | None]:
@@ -274,7 +342,7 @@ def set_status(body: StatusIn, user: Person = Depends(current_user), db: Session
 # ---------- 予約 ----------
 @app.get("/api/reservations/mine")
 def my_reservations(user: Person = Depends(current_user), db: Session = Depends(get_db)):
-    ctx = svc.Ctx(db)
+    ctx = svc.Ctx(db, user)
     rs = db.scalars(select(Reservation).where(Reservation.person_id == user.id, Reservation.day >= today()).order_by(Reservation.day, Reservation.start))
     return {"reservations": [svc.reservation_view(ctx, r) for r in rs]}
 
@@ -313,7 +381,7 @@ def _save_reservation(db: Session, user: Person, body: ReservationIn, existing: 
 @app.post("/api/reservations", status_code=201)
 def create_reservation(body: ReservationIn, user: Person = Depends(current_user), db: Session = Depends(get_db)):
     r = _save_reservation(db, user, body, None)
-    return svc.reservation_view(svc.Ctx(db), r)
+    return svc.reservation_view(svc.Ctx(db, user), r)
 
 
 @app.put("/api/reservations/{rid}")
@@ -322,7 +390,7 @@ def update_reservation(rid: int, body: ReservationIn, user: Person = Depends(cur
     if not r or r.person_id != user.id:
         raise HTTPException(404, "予約が見つかりません")
     r = _save_reservation(db, user, body, r)
-    return svc.reservation_view(svc.Ctx(db), r)
+    return svc.reservation_view(svc.Ctx(db, user), r)
 
 
 @app.delete("/api/reservations/{rid}")
@@ -364,6 +432,263 @@ def consult(body: ConsultIn, user: Person = Depends(current_user), db: Session =
     return {"ok": True, "helped": helped, "learned": learned}
 
 
+# ---------- 会いに行ける Know-Who：見つける ----------
+@app.get("/api/knowwho")
+def knowwho_search(q: str = "", user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    q = q.strip()[:300]
+    out = kw.search(db, svc.Ctx(db, user), q, user)
+    if out["topics"]:  # 推薦後の相談依頼率（H-1）の分母
+        svc.audit(db, user, "knowwho.search", f"topics:{','.join(out['topics'])}", candidates=len(out["candidates"]))
+        db.commit()
+    return out
+
+
+@app.get("/api/people/{pid}/profile")
+def person_profile(pid: str, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    if not db.get(Person, pid):
+        raise HTTPException(404, "相手が見つかりません")
+    return kw.profile(db, svc.Ctx(db, user), pid, user)
+
+
+@app.post("/api/knowledge/{mid}/view")
+def view_knowledge(mid: int, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    m = db.get(ConsultationMemo, mid)
+    if not m or m.status != "approved":
+        raise HTTPException(404, "見つかりません")
+    r = db.get(ConsultationRequest, m.request_id)
+    if user.id not in (r.asker_id, r.expert_id):  # 次の相談者に参照された回数（H-5）
+        m.views += 1
+        db.commit()
+    return {"views": m.views}
+
+
+# ---------- 設定（FR-12） ----------
+@app.get("/api/prefs")
+def get_prefs(user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    return svc.Ctx(db).pref(user.id)
+
+
+@app.put("/api/prefs")
+def put_prefs(body: PrefIn, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    p = db.get(Preference, user.id) or Preference(person_id=user.id)
+    p.opt_in, p.scope, p.notify, p.confirmed, p.updated_at = body.opt_in, body.scope, body.notify, True, datetime.now(timezone.utc)
+    db.add(p)
+    svc.audit(db, user, "prefs.update", f"person:{user.id}", opt_in=body.opt_in, scope=body.scope)
+    db.commit()
+    return svc.Ctx(db).pref(user.id)
+
+
+# ---------- 話す：相談の依頼（FR-05〜11） ----------
+def _request(db: Session, rid: int, user: Person) -> ConsultationRequest:
+    r = db.get(ConsultationRequest, rid)
+    if not r or user.id not in (r.asker_id, r.expert_id):
+        raise HTTPException(404, "相談が見つかりません")
+    return r
+
+
+def _view(db: Session, r: ConsultationRequest, user: Person) -> dict:
+    return kw.request_view(db, svc.Ctx(db, user), r, user)
+
+
+@app.get("/api/requests")
+def list_requests(user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    ctx = svc.Ctx(db, user)
+    rows = db.scalars(select(ConsultationRequest).where((ConsultationRequest.asker_id == user.id) | (ConsultationRequest.expert_id == user.id))
+                      .order_by(ConsultationRequest.created_at.desc()))
+    views = [kw.request_view(db, ctx, r, user, full=False) for r in rows]
+    return {"received": [v for v in views if v["role"] == "expert"], "sent": [v for v in views if v["role"] == "asker"], "inbox": kw.inbox(db, ctx, user)}
+
+
+@app.get("/api/inbox")
+def get_inbox(user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    return kw.inbox(db, svc.Ctx(db, user), user)
+
+
+@app.get("/api/requests/{rid}")
+def get_request(rid: int, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    return _view(db, _request(db, rid, user), user)
+
+
+@app.post("/api/requests", status_code=201)
+def create_request(body: RequestIn, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    if body.expert_id == user.id:
+        raise HTTPException(422, "自分には依頼できません")
+    if not db.get(Person, body.expert_id):
+        raise HTTPException(404, "相手が見つかりません")
+    lo, hi = settings.open_hour * 60, settings.close_hour * 60
+    slots = []
+    for s in body.slots:
+        d = svc.parse_day(s.day)
+        if d < today() or d > today() + timedelta(days=settings.book_ahead_days):
+            raise HTTPException(422, f"希望日は今日から{settings.book_ahead_days}日先までで選んでください")
+        h, m = map(int, s.start.split(":"))
+        if not (lo <= h * 60 + m and h * 60 + m + body.duration <= hi):
+            raise HTTPException(422, f"希望の時間は{settings.open_hour}時〜{settings.close_hour}時の間で選んでください")
+        if {"day": d.isoformat(), "start": s.start} not in slots:
+            slots.append({"day": d.isoformat(), "start": s.start})
+    r = ConsultationRequest(asker_id=user.id, expert_id=body.expert_id, topic=body.topic, purpose=body.purpose, viewpoint=body.viewpoint,
+                            message=body.message, slots=slots, duration=body.duration)
+    db.add(r)
+    db.flush()
+    svc.audit(db, user, "request.create", f"request:{r.id}", expert=body.expert_id, topic=body.topic)
+    db.commit()
+    return _view(db, r, user)
+
+
+@app.post("/api/requests/{rid}/accept")
+def accept_request(rid: int, body: AcceptIn, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    r = _request(db, rid, user)
+    if r.expert_id != user.id:
+        raise HTTPException(403, "依頼を受けた人だけが返事できます")
+    if r.status != "pending":
+        raise HTTPException(409, "この依頼にはもう返事しています")
+    if body.slot >= len(r.slots):
+        raise HTTPException(422, "日時の候補を選んでください")
+    s = r.slots[body.slot]
+    if date.fromisoformat(s["day"]) < today():
+        raise HTTPException(422, "過ぎた日は選べません。依頼した人に別の日を出してもらってください")
+    r.status, r.mode, r.day, r.start, r.responded_at = "accepted", body.mode, date.fromisoformat(s["day"]), s["start"], datetime.now(timezone.utc)
+    svc.audit(db, user, "request.accept", f"request:{r.id}", day=s["day"], start=s["start"], mode=body.mode)
+    db.commit()
+    return _view(db, r, user)
+
+
+@app.post("/api/requests/{rid}/decline")
+def decline_request(rid: int, body: DeclineIn, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    r = _request(db, rid, user)
+    if r.expert_id != user.id:
+        raise HTTPException(403, "依頼を受けた人だけが返事できます")
+    if r.status != "pending":
+        raise HTTPException(409, "この依頼にはもう返事しています")
+    if body.reason and body.reason not in kw.DECLINE_REASONS:
+        raise HTTPException(422, "辞退の理由を選び直してください")
+    r.status, r.decline_reason, r.responded_at = "declined", body.reason, datetime.now(timezone.utc)
+    svc.audit(db, user, "request.decline", f"request:{r.id}", reason=body.reason)
+    db.commit()
+    return _view(db, r, user)
+
+
+@app.post("/api/requests/{rid}/cancel")
+def cancel_request(rid: int, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    r = _request(db, rid, user)
+    if r.status not in ("pending", "accepted") or r.started_at:
+        raise HTTPException(409, "この相談は取り消せません")
+    r.status = "cancelled"
+    if r.reservation_id and (res := db.get(Reservation, r.reservation_id)) and res.day >= today():
+        db.delete(res)  # 相談のために取った席は空ける
+    r.reservation_id = None
+    svc.audit(db, user, "request.cancel", f"request:{r.id}")
+    db.commit()
+    return _view(db, r, user)
+
+
+@app.post("/api/requests/{rid}/seat")
+def request_seat(rid: int, body: SeatIn, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    r = _request(db, rid, user)
+    if r.asker_id != user.id:
+        raise HTTPException(403, "席は依頼した人が取ります")
+    if r.status != "accepted" or r.mode != "office" or not r.day or r.day < today():
+        raise HTTPException(409, "この相談では席を取れません")
+    mine = db.scalar(select(Reservation).where(Reservation.person_id == user.id, Reservation.day == r.day))
+    body_in = ReservationIn(seat_id=body.seat_id, day=r.day.isoformat(), all_day=True, purpose=f"{r.topic}の相談"[:100], near_person_id=r.expert_id)
+    res = _save_reservation(db, user, body_in, mine)  # 同じ日にほかの席を取っていれば、こちらへ移す
+    r.reservation_id = res.id
+    svc.audit(db, user, "request.seat", f"request:{r.id}", seat=body.seat_id)
+    db.commit()
+    return _view(db, r, user)
+
+
+@app.post("/api/requests/{rid}/online")
+def request_online(rid: int, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    """出社日が合わないときは、オンライン相談に切り替える（座席は取らない）。"""
+    r = _request(db, rid, user)
+    if r.status != "accepted" or r.started_at:
+        raise HTTPException(409, "この相談は切り替えられません")
+    r.mode = "online"
+    if r.reservation_id and (res := db.get(Reservation, r.reservation_id)) and res.day >= today():
+        db.delete(res)
+    r.reservation_id = None
+    svc.audit(db, user, "request.online", f"request:{r.id}")
+    db.commit()
+    return _view(db, r, user)
+
+
+@app.post("/api/requests/{rid}/start")
+def start_request(rid: int, body: StartIn, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    """当日のチェックイン。相談の「開始」として扱い、双方に残り時間を出す（FR-09）。"""
+    r = _request(db, rid, user)
+    if r.status != "accepted":
+        raise HTTPException(409, "受けてもらった相談だけ始められます")
+    if r.day != today():
+        raise HTTPException(409, "相談の日になったら始められます")
+    if body.online:
+        r.mode = "online"
+    warning = None
+    if r.mode == "office" and user.id == r.asker_id and r.reservation_id:
+        res = db.get(Reservation, r.reservation_id)
+        p = _my_presence(db, user)
+        if res and res.day == today() and not (p and p.status == "office" and p.seat_id == res.seat_id and not p.checked_out_at):
+            warning = checkin(CheckinIn(seat_id=res.seat_id, purpose=f"{r.topic}の相談"[:100], near_person_id=r.expert_id), user, db)["warning"]
+    if not r.started_at:
+        r.started_at = datetime.now(timezone.utc)
+    svc.audit(db, user, "request.start", f"request:{r.id}", mode=r.mode)
+    db.commit()
+    return {**_view(db, r, user), "warning": warning}
+
+
+@app.post("/api/requests/{rid}/finish")
+def finish_request(rid: int, body: FinishIn, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    r = _request(db, rid, user)
+    if r.status != "accepted" or not r.started_at:
+        raise HTTPException(409, "始めた相談だけ終えられます")
+    r.status, r.ended_at = "done", datetime.now(timezone.utc)
+    if user.id == r.asker_id and body.helpful is not None:
+        r.helpful = body.helpful
+    kw.record_consultation(db, r)
+    svc.audit(db, user, "request.finish", f"request:{r.id}")
+    db.commit()
+    return _view(db, r, user)
+
+
+@app.put("/api/requests/{rid}/memo")
+def save_memo(rid: int, body: MemoIn, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    """相談メモ。依頼者と受諾者の双方が確認・修正できる。承認されるまで公開しない（FR-10・11）。"""
+    r = _request(db, rid, user)
+    if not (r.status == "done" or (r.status == "accepted" and r.started_at)):
+        raise HTTPException(409, "相談を始めてから書けます")
+    m = db.scalar(select(ConsultationMemo).where(ConsultationMemo.request_id == r.id))
+    if m and m.status == "approved":
+        raise HTTPException(409, "承認済みのメモは直せません")
+    m = m or ConsultationMemo(request_id=r.id, author_id=user.id)
+    m.heard, m.learned, m.reuse, m.updated_at = body.heard, body.learned, body.reuse, datetime.now(timezone.utc)
+    db.add(m)
+    if user.id == r.asker_id and body.helpful is not None:
+        r.helpful = body.helpful
+    if r.status == "accepted":  # メモを書いた＝相談をした
+        r.status, r.ended_at = "done", datetime.now(timezone.utc)
+    kw.record_consultation(db, r)
+    svc.audit(db, user, "memo.save", f"request:{r.id}")
+    db.commit()
+    return _view(db, r, user)
+
+
+@app.post("/api/requests/{rid}/memo/approve")
+def approve_memo(rid: int, body: MemoIn | None = None, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    r = _request(db, rid, user)
+    if r.expert_id != user.id:
+        raise HTTPException(403, "相談を受けた人だけが承認できます")
+    m = db.scalar(select(ConsultationMemo).where(ConsultationMemo.request_id == r.id))
+    if not m or m.status != "pending":
+        raise HTTPException(409, "承認待ちのメモがありません")
+    if body:
+        m.heard, m.learned, m.reuse = body.heard, body.learned, body.reuse
+    m.status, m.approved_by, m.approved_at = "approved", user.id, datetime.now(timezone.utc)
+    learned = kw.learn_topic(db, r)
+    svc.audit(db, user, "memo.approve", f"request:{r.id}", topic=r.topic)
+    db.commit()
+    return {**_view(db, r, user), "learned": learned}
+
+
 # ---------- 会議室 ----------
 @app.get("/api/rooms/{room_id}")
 def room(room_id: str, day: str | None = None, _: Person = Depends(current_user), db: Session = Depends(get_db)):
@@ -401,7 +726,8 @@ def book_room(room_id: str, body: RoomBookingIn, user: Person = Depends(current_
 # ---------- 分析 ----------
 @app.get("/api/analytics")
 def analytics(days: int = 30, _: Person = Depends(require_admin), db: Session = Depends(get_db)):
-    return svc.analytics(db, svc.Ctx(db), max(7, min(days, 90)))
+    days = max(7, min(days, 90))
+    return {**svc.analytics(db, svc.Ctx(db), days), "cycle": kw.cycle(db, days)}
 
 
 @app.post("/api/admin/reset")
@@ -419,4 +745,4 @@ if FRONT.exists() and os.getenv("SERVE_FRONTEND", "true").lower() != "false":
 else:
     @app.get("/")
     def root():
-        return {"service": "座席ナビ API", "docs": "/api/docs" if settings.is_demo else None}
+        return {"service": "会いに行ける Know-Who API", "docs": "/api/docs" if settings.is_demo else None}

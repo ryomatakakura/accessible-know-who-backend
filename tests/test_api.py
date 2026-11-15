@@ -219,7 +219,7 @@ def test_sso_mode_uses_easy_auth_header():
 
 def test_security_headers_and_static(c):
     r = c.get("/")
-    assert r.status_code == 200 and "座席ナビ" in r.text
+    assert r.status_code == 200 and "Know-Who" in r.text
     assert "default-src 'self'" in r.headers["content-security-policy"]
     assert c.get("/api/health").headers["cache-control"] == "no-store"
 
@@ -274,3 +274,150 @@ def test_reservation_keeps_purpose_and_search_by_topic(c):
     assert r.status_code == 201 and r.json()["purpose"] == "補助金の申請を相談" and r.json()["near"]["id"] == "u40"
     s = c.get("/api/search?q=補助金", headers=as_("u00")).json()
     assert s["topics"] == ["補助金申請"] and any(p["id"] == "u40" for p in s["people"])
+
+
+# ---------- 会いに行ける Know-Who：見つける → 話す → 残す ----------
+def request_body(day, expert="u01", **kw):
+    body = {"expert_id": expert, "topic": "非対面サービスの審査", "purpose": "eKYCで本人確認をどこまで省けるか知りたい",
+            "viewpoint": "コンプラの判断基準", "message": "近藤さん\n相談させてください。", "slots": [{"day": str(day), "start": "20:00"}], "duration": 30}
+    return {**body, **kw}
+
+
+def test_knowwho_recommends_with_reason_contacts_and_schedule(c):
+    r = c.get("/api/knowwho?q=非対面サービスの審査について聞きたい", headers=as_("u00")).json()
+    assert r["topics"][0] == "非対面サービスの審査"
+    assert 1 <= len(r["candidates"]) <= 5
+    ids = [e["person"]["id"] for e in r["candidates"]]
+    assert {"u01", "u18"} <= set(ids) and "u00" not in ids
+    for e in r["candidates"]:
+        assert e["reason"].endswith("。")  # 推薦理由を必ず1文で
+        assert {"docs", "answers", "helped", "month", "accepting"} <= set(e["suitability"])
+        assert len(e["contacts"]["common"]) <= 3
+        assert e["schedule"]["visible"] and len(e["schedule"]["days"]) == 5
+        assert all("seat" not in d for d in e["schedule"]["days"])  # 出社予定はエリアまで。座席番号は出さない
+    assert r["knowledge"] and all(k["topic"] == "非対面サービスの審査" for k in r["knowledge"])
+    assert c.get("/api/knowwho?q=", headers=as_("u00")).json()["candidates"] == []
+
+
+def test_opt_out_hides_from_recommendations(c):
+    assert "u18" in [e["person"]["id"] for e in c.get("/api/knowwho?q=非対面サービスの審査", headers=as_("u00")).json()["candidates"]]
+    assert c.get("/api/prefs", headers=as_("u18")).json() == {"opt_in": True, "scope": "all", "notify": True, "confirmed": False}
+    p = c.put("/api/prefs", json={"opt_in": False, "scope": "all"}, headers=as_("u18")).json()
+    assert p["opt_in"] is False and p["confirmed"] is True
+    assert "u18" not in [e["person"]["id"] for e in c.get("/api/knowwho?q=非対面サービスの審査", headers=as_("u00")).json()["candidates"]]
+    assert all(e["person"]["id"] != "u18" for e in c.get("/api/recommend?q=非対面サービスの審査", headers=as_("u00")).json()["here"])
+    assert c.put("/api/prefs", json={"opt_in": True, "scope": "everyone"}, headers=as_("u18")).status_code == 422
+
+
+def test_private_schedule_is_never_returned_to_others(c):
+    d = today(c) + timedelta(days=3)
+    seat = free_of_reservations(c, d, 1)[0]
+    assert c.post("/api/reservations", json={"seat_id": seat, "day": str(d)}, headers=as_("u40")).status_code == 201  # u40 は出社予定を非公開
+    st = c.get(f"/api/state?floor={seat[:3]}&day={d}", headers=as_("u00")).json()
+    occ = next(s["occ"] for s in st["seats"] if s["id"] == seat)
+    assert occ["person"] == "_hidden" and occ["reservation"] is None
+    det = c.get(f"/api/seats/{seat}?day={d}", headers=as_("u00")).json()
+    assert det["reservations"][0]["person"]["id"] == "_hidden" and det["reservations"][0]["id"] is None
+    loc = next(p for p in c.get(f"/api/people?day={d}", headers=as_("u00")).json()["people"] if p["id"] == "u40")["location"]
+    assert loc["status"] == "hidden" and loc["seat"] is None
+    assert c.get("/api/people/u40/profile", headers=as_("u00")).json()["schedule"] == {"visible": False, "days": [], "next_office": None}
+    assert c.get("/api/people/u40/profile", headers=as_("u40")).json()["schedule"]["visible"]  # 自分には見える
+    # u17 は「同じ部署だけ」：開発部の人には見え、経営企画部の人には見えない
+    assert c.get("/api/people/u17/profile", headers=as_("u18")).json()["schedule"]["visible"]
+    assert not c.get("/api/people/u17/profile", headers=as_("u00")).json()["schedule"]["visible"]
+
+
+def test_request_rules(c):
+    t = today(c)
+    assert c.post("/api/requests", json=request_body(t, message="   "), headers=as_("u00")).status_code == 422  # 空欄では送れない
+    assert c.post("/api/requests", json=request_body(t, expert="u00"), headers=as_("u00")).status_code == 422
+    four = [{"day": str(t + timedelta(days=i)), "start": "10:00"} for i in range(4)]
+    assert c.post("/api/requests", json=request_body(t, slots=four), headers=as_("u00")).status_code == 422  # 第3候補まで
+    assert c.post("/api/requests", json=request_body(t, duration=45), headers=as_("u00")).status_code == 422
+    assert c.post("/api/requests", json=request_body(t - timedelta(days=1)), headers=as_("u00")).status_code == 422
+    late = request_body(t, slots=[{"day": str(t), "start": "20:45"}])
+    assert c.post("/api/requests", json=late, headers=as_("u00")).status_code == 422  # 終わりが営業時間を過ぎる
+    r = c.post("/api/requests", json=request_body(t), headers=as_("u00")).json()
+    assert c.get(f"/api/requests/{r['id']}", headers=as_("u05")).status_code == 404  # 当事者だけが見られる
+    assert c.post(f"/api/requests/{r['id']}/accept", json={"slot": 0}, headers=as_("u00")).status_code == 403
+    assert c.post(f"/api/requests/{r['id']}/start", json={}, headers=as_("u00")).status_code == 409  # 受諾前は始められない
+
+
+def test_request_accept_seat_start_memo_and_knowledge(c):
+    t = today(c)
+    before = len(c.get("/api/knowwho?q=非対面サービスの審査", headers=as_("u00")).json()["knowledge"])
+    r = c.post("/api/requests", json=request_body(t), headers=as_("u00"))
+    assert r.status_code == 201, r.text
+    rid = r.json()["id"]
+    got = c.get("/api/requests", headers=as_("u01")).json()
+    assert any(x["id"] == rid for x in got["received"]) and any(i["kind"] == "respond" and i["id"] == rid for i in got["inbox"]["items"])
+    v = c.post(f"/api/requests/{rid}/accept", json={"slot": 0}, headers=as_("u01")).json()
+    assert v["status"] == "accepted" and v["day"] == str(t) and v["end"] == "20:30"
+    assert c.post(f"/api/requests/{rid}/accept", json={"slot": 0}, headers=as_("u01")).status_code == 409
+    v = c.get(f"/api/requests/{rid}", headers=as_("u00")).json()
+    assert v["step"] == 3 and v["expert_seat"] and v["nearby"] and len(v["nearby"]) <= 3
+    assert all(s["dist"] <= 640 for s in v["nearby"])  # 相手から半径10席以内
+    seat = v["nearby"][0]["id"]
+    v = c.post(f"/api/requests/{rid}/seat", json={"seat_id": seat}, headers=as_("u00")).json()
+    assert v["asker_seat"]["id"] == seat and v["step"] == 4
+    mine = c.get("/api/reservations/mine", headers=as_("u00")).json()["reservations"]
+    assert any(x["seat"]["id"] == seat and x["near"]["id"] == "u01" for x in mine)
+    v = c.post(f"/api/requests/{rid}/start", json={}, headers=as_("u00")).json()
+    assert v["started_at"] and v["ends_at"] and v["step"] == 5
+    st = c.get(f"/api/state?floor={seat[:3]}", headers=as_("u00")).json()
+    assert st["me"]["location"]["status"] == "office" and st["me"]["location"]["seat"]["id"] == seat  # 相談の開始と一緒にチェックイン
+    memo = {"heard": "eKYCでどこまで省けたか", "learned": "上限額と追加確認で例外を認めた", "reuse": "先にリスク管理部と事前協議する", "helpful": True}
+    assert c.put(f"/api/requests/{rid}/memo", json={**memo, "reuse": " "}, headers=as_("u00")).status_code == 422
+    v = c.put(f"/api/requests/{rid}/memo", json=memo, headers=as_("u00")).json()
+    assert v["status"] == "done" and v["memo"]["status"] == "pending" and v["helpful"] is True
+    # 承認されるまで公開しない
+    assert len(c.get("/api/knowwho?q=非対面サービスの審査", headers=as_("u05")).json()["knowledge"]) == before
+    assert c.post(f"/api/requests/{rid}/memo/approve", headers=as_("u00")).status_code == 403
+    v = c.post(f"/api/requests/{rid}/memo/approve", headers=as_("u01")).json()
+    assert v["memo"]["status"] == "approved" and v["step"] == 6
+    assert c.put(f"/api/requests/{rid}/memo", json=memo, headers=as_("u00")).status_code == 409
+    kn = c.get("/api/knowwho?q=非対面サービスの審査", headers=as_("u05")).json()["knowledge"]
+    mid = next(k["id"] for k in kn if k["learned"] == memo["learned"])
+    assert c.post(f"/api/knowledge/{mid}/view", headers=as_("u05")).json()["views"] == 1
+    assert c.post(f"/api/knowledge/{mid}/view", headers=as_("u00")).json()["views"] == 1  # 当事者が開いても数えない
+    cyc = c.get("/api/analytics", headers=as_("u00")).json()["cycle"]
+    assert cyc["requests"] >= 1 and cyc["approved"] >= 1 and cyc["h4_knowledge"] is not None
+
+
+def test_request_decline_offers_alternatives_and_cancel_frees_seat(c):
+    t = today(c)
+    rid = c.post("/api/requests", json=request_body(t + timedelta(days=1), expert="u18"), headers=as_("u00")).json()["id"]
+    assert c.post(f"/api/requests/{rid}/decline", json={"reason": "気分"}, headers=as_("u18")).status_code == 422
+    v = c.post(f"/api/requests/{rid}/decline", json={"reason": "今は忙しい（負担が大きい）"}, headers=as_("u18")).json()
+    assert v["status"] == "declined"
+    v = c.get(f"/api/requests/{rid}", headers=as_("u00")).json()
+    alt = [e["person"]["id"] for e in v["alternatives"]]
+    assert 1 <= len(alt) <= 2 and "u18" not in alt  # 代わりの詳しい人を1名以上
+    rid = c.post("/api/requests", json=request_body(t), headers=as_("u00")).json()["id"]
+    c.post(f"/api/requests/{rid}/accept", json={"slot": 0}, headers=as_("u01"))
+    seat = c.get(f"/api/requests/{rid}", headers=as_("u00")).json()["nearby"][0]["id"]
+    c.post(f"/api/requests/{rid}/seat", json={"seat_id": seat}, headers=as_("u00"))
+    assert c.post(f"/api/requests/{rid}/cancel", headers=as_("u00")).json()["status"] == "cancelled"
+    assert not any(x["seat"]["id"] == seat for x in c.get("/api/reservations/mine", headers=as_("u00")).json()["reservations"])
+    # 出社日が合わないときはオンラインへ。取った席は空ける
+    rid = c.post("/api/requests", json=request_body(t), headers=as_("u00")).json()["id"]
+    c.post(f"/api/requests/{rid}/accept", json={"slot": 0}, headers=as_("u01"))
+    seat = c.get(f"/api/requests/{rid}", headers=as_("u00")).json()["nearby"][0]["id"]
+    c.post(f"/api/requests/{rid}/seat", json={"seat_id": seat}, headers=as_("u00"))
+    v = c.post(f"/api/requests/{rid}/online", headers=as_("u01")).json()
+    assert v["mode"] == "online" and v["step"] == 4
+    assert not any(x["seat"]["id"] == seat for x in c.get("/api/reservations/mine", headers=as_("u00")).json()["reservations"])
+
+
+def test_online_start_and_demo_inbox(c):
+    t = today(c)
+    rid = c.post("/api/requests", json=request_body(t), headers=as_("u00")).json()["id"]
+    c.post(f"/api/requests/{rid}/accept", json={"slot": 0, "mode": "online"}, headers=as_("u01"))
+    v = c.get(f"/api/requests/{rid}", headers=as_("u00")).json()
+    assert v["mode"] == "online" and v["step"] == 4 and "nearby" not in v  # オンラインなら席は取らない
+    assert c.post(f"/api/requests/{rid}/start", json={}, headers=as_("u01")).json()["started_at"]
+    assert c.post(f"/api/requests/{rid}/finish", json={}, headers=as_("u01")).json()["status"] == "done"
+    kinds = [i["kind"] for i in c.get("/api/inbox", headers=as_("u00")).json()["items"]]
+    assert kinds.count("respond") == 2 and "approve" in kinds and "memo" in kinds  # デモの利用者がすぐ試せる
+    received = c.get("/api/requests", headers=as_("u00")).json()["received"]
+    assert any(x["overdue"] for x in received)  # 48時間返事がない依頼

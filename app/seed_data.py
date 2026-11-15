@@ -278,3 +278,142 @@ def dynamic(today: date, tz):
                 else:
                     h += 1
     return presence, reservations, bookings, consultations
+
+
+# ---------- 相談の依頼とメモ（会いに行ける Know-Who） ----------
+# 公開範囲を変えている人（推薦の対象外・出社予定を非公開・同じ部署だけ）
+PREFS = [{"person_id": "u44", "opt_in": False, "scope": "all", "confirmed": True},
+         {"person_id": "u40", "opt_in": True, "scope": "private", "confirmed": True},
+         {"person_id": "u17", "opt_in": True, "scope": "dept", "confirmed": True}]
+
+_VIEWPOINTS = {
+    "非対面サービスの審査": "本人確認をどこまで省けたかの判断基準",
+    "コンプライアンス": "コンプラ部門が許容した条件と、その理由",
+    "補助金申請": "採択された申請書で評価された書き方",
+    "生成AI活用": "社内データを入れてよい範囲の決め方",
+    "予算策定": "前年に削られた項目と、通った説明の仕方",
+    "中期経営計画": "数値目標を決めたときの前提と議論の経緯",
+    "データ分析": "使ってよいデータと集計の粒度",
+}
+_MEMOS = {
+    "非対面サービスの審査": ("アプリ申込で eKYC を入れたとき、どの確認を省略できたか",
+                       "規程上は対面確認が原則だが、金額上限と追加の本人確認書類で例外を認めた。決め手はリスク管理部との事前協議記録",
+                       "新しい非対面サービスは、上限額と追加確認の組み合わせを先に決め、リスク管理部と事前協議してから稟議を出す"),
+    "コンプライアンス": ("キャンペーン表示でコンプラが止めた表現と通った表現",
+                     "「必ず」「最大」は根拠資料があれば可。条件の文字サイズが本文の8割以上かも見られていた",
+                     "表示のチェックリスト（根拠資料・条件の文字サイズ・期間）を企画書に添付する"),
+    "補助金申請": ("事業再構築補助金で採択された申請書の書き方",
+              "審査で見られたのは数値計画の根拠。既存事業との違いを図で1枚にまとめたのが効いた",
+              "申請書の最初に「既存事業との違い」の図を置く。数値計画は3年分の根拠を添える"),
+    "生成AI活用": ("生成AIに社内データを入れてよい範囲",
+              "顧客情報と未公表の数値は不可。社内規程の文案や公開済み資料の要約は可、と情報セキュリティ委員会で整理済み",
+              "使う前に「顧客情報・未公表数値を含まないか」を確認する1行を手順書に入れる"),
+    "予算策定": ("前年度に削られた研修予算と、復活させた説明",
+             "削られたのは効果が数字で示せなかったから。翌年は受講後3か月の業務指標で示して通った",
+             "新しい費用は「何が何%変わるか」を先に決め、測り方まで書いてから出す"),
+}
+_GENERIC = ("{topic}で過去に判断が分かれた点と、そのときの決め手",
+            "文書には結論しか残っていないが、当時は{viewpoint}をめぐって関係部署と調整していた。最終的には影響範囲を小さく始めることで合意した",
+            "同じテーマで進めるときは、最初に関係部署へ論点を共有し、小さく試す案を添える")
+
+
+def _viewpoint(topic):
+    return _VIEWPOINTS.get(topic, f"{topic}で過去に許容された範囲")
+
+
+def _memo(topic):
+    heard, learned, reuse = _MEMOS.get(topic, _GENERIC)
+    vp = _viewpoint(topic)
+    return {"heard": heard.format(topic=topic, viewpoint=vp), "learned": learned.format(topic=topic, viewpoint=vp),
+            "reuse": reuse.format(topic=topic, viewpoint=vp)}
+
+
+def message(expert_name, topic, purpose, viewpoint, minutes):
+    """依頼文のテンプレート（画面の app.js も同じ文面で作る）。"""
+    return (f"{expert_name}さん\n\nはじめまして。{topic}について、{purpose}。\n"
+            f"特に「{viewpoint}」の観点で、過去の判断の背景を教えていただけないでしょうか。\n"
+            f"{minutes}分ほどお時間をいただけると助かります。候補の日時から選んでいただければ、近くの席を取って伺います。")
+
+
+def requests(today: date, tz):
+    """過去30日の相談依頼（メモつき）と、デモの利用者（u00）がすぐ試せる依頼。dict の "memo" はメモの中身。"""
+    ps = {p["id"]: p for p in people()}
+    skills = {}
+    for e in expertise():
+        skills.setdefault(e["person_id"], []).append(e["topic"])
+    opt_out = {p["person_id"] for p in PREFS if not p["opt_in"]}
+    experts = sorted(pid for pid in skills if pid not in opt_out and pid != "u00")
+    ids = sorted(ps)
+    rnd = random.Random(today.toordinal() * 5 + 3)
+    out = []
+
+    def add(asker, expert, topic, created, status, day=None, start="10:00", duration=30, reason=None, memo=None, helpful=None, views=0,
+            slots=None):
+        purpose = "過去の判断の背景を知りたい"
+        vp = _viewpoint(topic)
+        slots = slots or [{"day": (day or created.date()).isoformat(), "start": start}]
+        r = {"asker_id": asker, "expert_id": expert, "topic": topic, "purpose": purpose, "viewpoint": vp,
+             "message": message(ps[expert]["name"], topic, purpose, vp, duration), "slots": slots, "duration": duration, "status": status,
+             "mode": "office", "day": day if status in ("accepted", "done") else None, "start": start if status in ("accepted", "done") else None,
+             "decline_reason": reason, "created_at": created, "helpful": helpful,
+             "responded_at": created + timedelta(hours=rnd.randint(2, 30)) if status not in ("pending", "cancelled") else None}
+        if status == "done":
+            st = _jst(day, int(start[:2]), int(start[3:]), tz)
+            r["started_at"], r["ended_at"] = st, st + timedelta(minutes=duration)
+        if memo:
+            r["memo"] = {**_memo(topic), **memo, "views": views}
+        out.append(r)
+
+    # 過去30日：相談が生まれ、メモが残り、次の人に読まれていく
+    reasons = ["今は忙しい（負担が大きい）", "日時が合わない", "このテーマに詳しくない", None]
+    for back in range(30, 1, -1):
+        d = today - timedelta(days=back)
+        if d.weekday() > 4:
+            continue
+        for _ in range(rnd.randint(0, 2)):
+            ex = rnd.choice(experts)
+            asker = rnd.choice([i for i in ids if i not in (ex, "u00")])
+            topic = rnd.choice(skills[ex])
+            created = _jst(d, rnd.randint(9, 17), rnd.choice([0, 15, 30, 45]), tz)
+            meet = d + timedelta(days=rnd.randint(1, 3))
+            while meet.weekday() > 4:
+                meet += timedelta(days=1)
+            roll = rnd.random()
+            if roll < 0.14:
+                add(asker, ex, topic, created, "declined", reason=rnd.choice(reasons))
+            elif roll < 0.18:
+                add(asker, ex, topic, created, "cancelled")
+            elif meet < today:
+                m = rnd.random()
+                memo = ({"status": "approved", "author_id": asker, "approved_by": ex} if m < 0.62
+                        else {"status": "pending", "author_id": asker} if m < 0.75 else None)
+                add(asker, ex, topic, created, "done", day=meet, start=f"{rnd.randint(10, 16)}:{rnd.choice(['00', '30'])}",
+                    duration=rnd.choice([15, 30, 30]), memo=memo, helpful=rnd.random() < 0.82, views=rnd.choice([0, 0, 1, 2, 3]) if memo else 0)
+
+    # デモの筋：「非対面サービスの審査」は近藤さん・藤田さんの相談メモが残っている
+    past = [d for d in (today - timedelta(days=k) for k in range(3, 25)) if d.weekday() < 5]
+    add("u20", "u01", "非対面サービスの審査", _jst(past[-1], 10, 0, tz), "done", day=past[-3], start="14:00",
+        memo={"status": "approved", "author_id": "u20", "approved_by": "u01"}, helpful=True, views=4)
+    add("u02", "u18", "非対面サービスの審査", _jst(past[-6], 11, 0, tz), "done", day=past[-8], start="11:00", duration=15,
+        memo={"status": "approved", "author_id": "u02", "approved_by": "u18",
+              "heard": "アプリ開発側から見た、非対面申込のセキュリティ審査の通し方",
+              "learned": "セキュリティ審査で毎回指摘されるのは端末認証とログの保存期間。先に情報セキュリティ部のひな形に沿うと1回で通る",
+              "reuse": "審査に出す前に、情報セキュリティ部のひな形（端末認証・ログ保存期間）で自己点検する"}, helpful=True, views=2)
+
+    # デモの利用者（高木さん・u00）がすぐ試せる依頼
+    mine = skills.get("u00", ["中期経営計画"])
+    nxt = [d for d in (today + timedelta(days=k) for k in range(1, 10)) if d.weekday() < 5]
+    prev = [d for d in (today - timedelta(days=k) for k in range(1, 10)) if d.weekday() < 5]
+    morning = datetime.combine(today, time(9, 0), tzinfo=tz)
+    # 返事待ち（受けた依頼）。1件は48時間たっていてリマインドが出る
+    add("u24", "u00", mine[0], morning - timedelta(hours=20), "pending",
+        slots=[{"day": nxt[0].isoformat(), "start": "10:00"}, {"day": nxt[1].isoformat(), "start": "15:00"}, {"day": nxt[2].isoformat(), "start": "11:30"}])
+    add("u38", "u00", mine[-1], morning - timedelta(hours=60), "pending", duration=15,
+        slots=[{"day": nxt[0].isoformat(), "start": "13:30"}, {"day": nxt[3].isoformat(), "start": "10:00"}])
+    # 来訪者の予定（受けた相談）
+    add("u20", "u00", mine[0], morning - timedelta(days=2), "accepted", day=nxt[1], start="16:00")
+    # メモの承認待ち（受けた相談）
+    add("u12", "u00", mine[-1], _jst(prev[2], 9, 0, tz), "done", day=prev[1], start="15:00", memo={"status": "pending", "author_id": "u12"}, helpful=True)
+    # 自分が聞いた相談：メモをまだ書いていない
+    add("u00", "u35", "生成AI活用", _jst(prev[3], 10, 0, tz), "done", day=prev[0], start="11:00", helpful=True)
+    return out

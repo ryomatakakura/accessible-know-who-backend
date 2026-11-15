@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .models import AuditLog, Consultation, Department, Expertise, Floor, Person, Presence, Reservation, Room, RoomBooking, Seat
+from .models import AuditLog, Consultation, Department, Expertise, Floor, Person, Preference, Presence, Reservation, Room, RoomBooking, Seat
 from .seed_data import STATUSES, match_topics
 from .timeutil import aware, hhmm_now, local_hhmm, today
 
@@ -32,11 +32,18 @@ def overlaps(a_start: str, a_end: str, b_start: str, b_end: str) -> bool:
     return a_start < b_end and b_start < a_end
 
 
-class Ctx:
-    """1リクエストの中で何度も使う参照データをまとめて読む。"""
+# 出社予定を見せない人の予約は、この「人」に置き換えて返す（NF-09：非公開の人の予定は他者に一切返さない）
+HIDDEN = {"id": "_hidden", "name": "非公開の予定", "dept": "", "dept_name": "", "title": "", "color": "#c3cbd7", "email": "",
+          "is_admin": False, "skills": []}
+PREF_DEFAULT = {"opt_in": True, "scope": "all", "notify": True, "confirmed": False}
 
-    def __init__(self, db: Session):
+
+class Ctx:
+    """1リクエストの中で何度も使う参照データをまとめて読む。viewer を渡すと、その人に見せてよい範囲だけを返す。"""
+
+    def __init__(self, db: Session, viewer: Person | None = None):
         self.db = db
+        self.viewer = viewer
         self.depts = {d.id: d.name for d in db.scalars(select(Department))}
         self.people = {p.id: p for p in db.scalars(select(Person))}
         self.seats = {s.id: s for s in db.scalars(select(Seat))}
@@ -44,7 +51,29 @@ class Ctx:
         self.skills: dict[str, dict[str, Expertise]] = defaultdict(dict)
         for e in db.scalars(select(Expertise)):
             self.skills[e.person_id][e.topic] = e
-        self.helped = Counter((c.expert_id, c.topic) for c in db.scalars(select(Consultation).where(Consultation.resolved.is_(True))))
+        cons = list(db.scalars(select(Consultation)))
+        self.helped = Counter((c.expert_id, c.topic) for c in cons if c.resolved)
+        # だれとだれが相談でつながっているか（共通の知人を探すのに使う）
+        self.links: dict[str, Counter] = defaultdict(Counter)
+        for c in cons:
+            self.links[c.asker_id][c.expert_id] += 1
+            self.links[c.expert_id][c.asker_id] += 1
+        self.prefs = {p.person_id: p for p in db.scalars(select(Preference))}
+
+    def pref(self, pid: str) -> dict:
+        p = self.prefs.get(pid)
+        return {"opt_in": p.opt_in, "scope": p.scope, "notify": p.notify, "confirmed": p.confirmed} if p else dict(PREF_DEFAULT)
+
+    def can_see_schedule(self, pid: str) -> bool:
+        if self.viewer is None or self.viewer.id == pid:
+            return True
+        scope = self.pref(pid)["scope"]
+        if scope == "dept":
+            return pid in self.people and self.people[pid].dept_id == self.viewer.dept_id
+        return scope != "private"
+
+    def person_or_hidden(self, pid: str) -> dict:
+        return self.person(pid) if self.can_see_schedule(pid) else dict(HIDDEN)
 
     def skill_list(self, pid: str) -> list[dict]:
         out = [{"topic": t, "docs": e.docs, "answers": e.answers, "helped": self.helped.get((pid, t), 0), "learned": e.learned}
@@ -78,6 +107,8 @@ def location(ctx: Ctx, pid: str, pres: dict, rsv: list[Reservation], day: date) 
     if p and p.status in STATUSES and p.status != "office":
         return {"status": p.status, "label": STATUSES[p.status], "seat": None}
     r = next((r for r in rsv if r.person_id == pid), None)
+    if r and not ctx.can_see_schedule(pid):
+        return {"status": "hidden", "label": "非公開", "seat": None}
     if r:
         return {"status": "reserved", "label": "予約あり", "seat": ctx.seat(r.seat_id), "start": r.start, "end": r.end, "all_day": r.all_day}
     if p and p.checked_out_at:
@@ -107,7 +138,9 @@ def floor_state(db: Session, ctx: Ctx, floor_id: str, day: date, me: Person) -> 
             rs = sorted(by_seat_rsv[s.id], key=lambda r: r.start)
             cur = next((r for r in rs if r.all_day or not is_today or r.end > now), None)
             if cur:
-                occ = {"person": cur.person_id, "kind": "rsv", "start": cur.start, "end": cur.end, "all_day": cur.all_day, "reservation": cur.id}
+                visible = ctx.can_see_schedule(cur.person_id)
+                occ = {"person": cur.person_id if visible else HIDDEN["id"], "kind": "rsv", "start": cur.start, "end": cur.end, "all_day": cur.all_day,
+                       "reservation": cur.id if visible else None}
         seats.append({"id": s.id, "occ": occ})
     rooms = []
     for r in db.scalars(select(Room).where(Room.floor_id == floor_id)):
@@ -157,7 +190,7 @@ def recommend(db: Session, ctx: Ctx, q: str, day: date, me: Person) -> dict:
     rsv = reservations_on(db, day)
     states: dict[str, dict] = {}
     for pid in ctx.people:
-        if pid == me.id:
+        if pid == me.id or not ctx.pref(pid)["opt_in"]:  # 推薦の対象外にしている人は出さない（FR-12）
             continue
         matched = [t for t in topics if t in ctx.skills.get(pid, {})]
         if not matched:
@@ -177,7 +210,7 @@ def recommend(db: Session, ctx: Ctx, q: str, day: date, me: Person) -> dict:
         else:
             nxt = db.scalar(select(Reservation).where(Reservation.person_id == pid, Reservation.day > day,
                                                       Reservation.day <= today() + timedelta(days=settings.book_ahead_days)).order_by(Reservation.day))
-            if nxt:
+            if nxt and ctx.can_see_schedule(pid):
                 entry["next"] = {"day": nxt.day.isoformat(), "seat": ctx.seat(nxt.seat_id)}
                 out["later"].append(entry)
             else:
@@ -189,8 +222,10 @@ def recommend(db: Session, ctx: Ctx, q: str, day: date, me: Person) -> dict:
 
 
 def reservation_view(ctx: Ctx, r: Reservation) -> dict:
-    return {"id": r.id, "seat": ctx.seat(r.seat_id), "person": ctx.person(r.person_id), "day": r.day.isoformat(), "start": r.start, "end": r.end, "all_day": r.all_day,
-            "purpose": r.purpose, "near": ctx.person(r.near_person_id) if r.near_person_id in ctx.people else None}
+    visible = ctx.can_see_schedule(r.person_id)
+    return {"id": r.id if visible else None, "seat": ctx.seat(r.seat_id), "person": ctx.person_or_hidden(r.person_id), "day": r.day.isoformat(),
+            "start": r.start, "end": r.end, "all_day": r.all_day, "purpose": r.purpose if visible else None,
+            "near": ctx.person(r.near_person_id) if visible and r.near_person_id in ctx.people else None}
 
 
 def seat_detail(db: Session, ctx: Ctx, sid: str, day: date) -> dict:

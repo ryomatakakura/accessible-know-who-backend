@@ -114,6 +114,59 @@ class Consultation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class Preference(Base):
+    """本人が決める公開の範囲（FR-12）。行がない人は初期値（推薦オン・全社に公開・未確認）として扱う。"""
+    __tablename__ = "preferences"
+    person_id: Mapped[str] = mapped_column(ForeignKey("people.id"), primary_key=True)
+    opt_in: Mapped[bool] = mapped_column(Boolean, default=True)          # 詳しい人として推薦されてよいか
+    scope: Mapped[str] = mapped_column(String(20), default="all")        # 出社予定の公開範囲：all / dept / private
+    notify: Mapped[bool] = mapped_column(Boolean, default=True)          # 依頼・リマインドを画面で知らせる
+    confirmed: Mapped[bool] = mapped_column(Boolean, default=False)      # 初回に設定を確かめたか
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ConsultationRequest(Base):
+    """相談の依頼（FR-05〜09）。pending → accepted → done、または declined / cancelled。"""
+    __tablename__ = "consultation_requests"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    asker_id: Mapped[str] = mapped_column(ForeignKey("people.id"), index=True)
+    expert_id: Mapped[str] = mapped_column(ForeignKey("people.id"), index=True)
+    topic: Mapped[str] = mapped_column(String(60), index=True)
+    purpose: Mapped[str] = mapped_column(String(300))      # 知りたいこと
+    viewpoint: Mapped[str] = mapped_column(String(200))    # 観点（例：コンプラの判断基準）
+    message: Mapped[str] = mapped_column(Text)             # 相手に届く依頼文
+    slots: Mapped[list] = mapped_column(JSON, default=list)  # 希望日時（第3候補まで）[{"day": "2026-11-19", "start": "10:00"}]
+    duration: Mapped[int] = mapped_column(Integer, default=30)  # 15 / 30 分
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    mode: Mapped[str] = mapped_column(String(20), default="office")  # office（対面）/ online
+    day: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)  # 受諾で決まった日時
+    start: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    decline_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    reservation_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 依頼者が取った近くの席
+    helpful: Mapped[bool | None] = mapped_column(Boolean, nullable=True)        # 相談後「役に立った」か（H-3）
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ConsultationMemo(Base):
+    """相談メモ（FR-10・11）。受諾者が承認するまで公開しない。承認後は同じテーマの「過去の相談」として出る。"""
+    __tablename__ = "consultation_memos"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    request_id: Mapped[int] = mapped_column(ForeignKey("consultation_requests.id"), unique=True)
+    heard: Mapped[str] = mapped_column(Text)      # 聞いたこと
+    learned: Mapped[str] = mapped_column(Text)    # 分かったこと
+    reuse: Mapped[str] = mapped_column(Text)      # 次に使える形
+    author_id: Mapped[str] = mapped_column(ForeignKey("people.id"))
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending（承認待ち）/ approved
+    approved_by: Mapped[str | None] = mapped_column(ForeignKey("people.id"), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    views: Mapped[int] = mapped_column(Integer, default=0)  # 次の相談者に参照された回数（H-5）
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class RoomBooking(Base):
     __tablename__ = "room_bookings"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
