@@ -1,6 +1,7 @@
 from datetime import date, datetime, timezone
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Date, DateTime, ForeignKey, Integer, LargeBinary, String, Text, UniqueConstraint
+from sqlalchemy.dialects import mysql
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -165,6 +166,31 @@ class ConsultationMemo(Base):
     views: Mapped[int] = mapped_column(Integer, default=0)  # 次の相談者に参照された回数（H-5）
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Attachment(Base):
+    """相談依頼につける資料。当事者の2人だけが見られる。中身はDBに置く（MySQLでは LONGBLOB）。"""
+    __tablename__ = "attachments"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    request_id: Mapped[int] = mapped_column(ForeignKey("consultation_requests.id"), index=True)
+    uploader_id: Mapped[str] = mapped_column(ForeignKey("people.id"))
+    filename: Mapped[str] = mapped_column(String(200))
+    content_type: Mapped[str] = mapped_column(String(100))
+    size: Mapped[int] = mapped_column(Integer)
+    data: Mapped[bytes] = mapped_column(LargeBinary().with_variant(mysql.LONGBLOB(), "mysql"), deferred=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class OpenQuestion(Base):
+    """詳しい人が見つからなかったときに置いておく質問。詳しい人が現れたら本人に知らせる。"""
+    __tablename__ = "open_questions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    asker_id: Mapped[str] = mapped_column(ForeignKey("people.id"), index=True)
+    q: Mapped[str] = mapped_column(String(300))
+    status: Mapped[str] = mapped_column(String(20), default="open", index=True)  # open / found / closed
+    found_person_id: Mapped[str | None] = mapped_column(ForeignKey("people.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    found_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class RoomBooking(Base):

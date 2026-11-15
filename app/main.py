@@ -3,15 +3,18 @@
 ローカル：cd backend → uvicorn app.main:app --reload → http://localhost:8000（画面も一緒に出る）
 本番：gunicorn -w 2 -k uvicorn.workers.UvicornWorker app.main:app（infra/main.bicep が設定する）。画面は別の Web App（frontend/）
 """
+import base64
+import binascii
 import logging
 import os
 import re
+from urllib.parse import quote
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -23,8 +26,8 @@ from . import services as svc
 from .auth import current_user, require_admin
 from .config import settings
 from .db import get_db, lock_row
-from .models import (Consultation, ConsultationMemo, ConsultationRequest, Expertise, Floor, Person, Preference, Presence, Reservation, Room,
-                     RoomBooking, Seat)
+from .models import (Attachment, Consultation, ConsultationMemo, ConsultationRequest, Expertise, Floor, OpenQuestion, Person, Preference, Presence, Reservation,
+                     Room, RoomBooking, Seat)
 from .seed_data import STATUSES, TOPICS, match_topics
 from .seeding import init_db, reset_demo
 from .timeutil import hhmm_now, today
@@ -151,8 +154,38 @@ class RequestIn(BaseModel):
     viewpoint: str = Field(min_length=1, max_length=200)  # 観点
     message: str = Field(min_length=1, max_length=2000)   # 依頼文（テンプレートから作って本人が直せる）
     slots: list[SlotIn] = Field(min_length=1, max_length=3)
-    duration: Literal[15, 30] = 30
+    duration: Literal[5, 15, 30] = 30
     _strip = field_validator("topic", "purpose", "viewpoint", "message")(_filled)
+
+
+class QuickIn(BaseModel):
+    """5分相談：相手とテーマだけで依頼する（日時の候補と依頼文はこちらで作る）。"""
+    expert_id: str
+    topic: str = Field(min_length=1, max_length=60)
+    q: str | None = Field(default=None, max_length=300)  # 探したときの言葉
+    slots: list[SlotIn] | None = Field(default=None, min_length=1, max_length=3)  # 選んだ日時（なければ候補を自動で作る）
+
+
+# 資料：1つの依頼に5つまで、1ファイル10MBまで。開いて危なくない形式だけ受け付ける
+ATTACH_MAX, ATTACH_COUNT = 10 * 1024 * 1024, 5
+ATTACH_TYPES = {
+    "pdf": "application/pdf", "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp",
+    "txt": "text/plain", "csv": "text/csv",
+    "doc": "application/msword", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xls": "application/vnd.ms-excel", "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "ppt": "application/vnd.ms-powerpoint", "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
+
+class AttachmentIn(BaseModel):
+    filename: str = Field(min_length=1, max_length=200)
+    data: str = Field(min_length=1)  # base64（画面からはファイルを読み込んで送る）
+    _strip = field_validator("filename")(_filled)
+
+
+class QuestionIn(BaseModel):
+    q: str = Field(min_length=1, max_length=300)
+    _strip = field_validator("q")(_filled)
 
 
 class AcceptIn(BaseModel):
@@ -174,14 +207,15 @@ class StartIn(BaseModel):
 
 class FinishIn(BaseModel):
     helpful: bool | None = None
+    note: str | None = Field(default=None, max_length=200)  # 「何がわかったか」の一言
 
 
 class MemoIn(BaseModel):
     heard: str = Field(min_length=1, max_length=2000)    # 聞いたこと
     learned: str = Field(min_length=1, max_length=2000)  # 分かったこと
-    reuse: str = Field(min_length=1, max_length=2000)    # 次に使える形
+    reuse: str = Field(default="", max_length=2000)      # 次に使える形（一言メモのときは空でよい）
     helpful: bool | None = None
-    _strip = field_validator("heard", "learned", "reuse")(_filled)
+    _strip = field_validator("heard", "learned")(_filled)
 
 
 class PrefIn(BaseModel):
@@ -439,8 +473,42 @@ def knowwho_search(q: str = "", user: Person = Depends(current_user), db: Sessio
     out = kw.search(db, svc.Ctx(db, user), q, user)
     if out["topics"]:  # 推薦後の相談依頼率（H-1）の分母
         svc.audit(db, user, "knowwho.search", f"topics:{','.join(out['topics'])}", candidates=len(out["candidates"]))
-        db.commit()
+    if q and not out["candidates"]:  # 知識の空白として経営画面に回す
+        svc.audit(db, user, "knowwho.gap", "q", q=q[:100], topics=out["topics"])
+    db.commit()
     return out
+
+
+# ---------- 詳しい人がいないときに置いておく質問 ----------
+@app.post("/api/questions", status_code=201)
+def post_question(body: QuestionIn, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    ctx = svc.Ctx(db, user)
+    oq = db.scalar(select(OpenQuestion).where(OpenQuestion.asker_id == user.id, OpenQuestion.q == body.q, OpenQuestion.status != "closed"))
+    if not oq:
+        oq = OpenQuestion(asker_id=user.id, q=body.q)
+        db.add(oq)
+        db.flush()
+        svc.audit(db, user, "question.post", f"question:{oq.id}")
+    db.commit()
+    return kw.question_view(ctx, oq)
+
+
+@app.get("/api/questions")
+def my_questions(user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    ctx = svc.Ctx(db, user)
+    kw.check_questions(db, ctx, user)
+    rows = db.scalars(select(OpenQuestion).where(OpenQuestion.asker_id == user.id, OpenQuestion.status != "closed").order_by(OpenQuestion.created_at.desc()))
+    return {"questions": [kw.question_view(ctx, q) for q in rows]}
+
+
+@app.post("/api/questions/{qid}/close")
+def close_question(qid: int, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    oq = db.get(OpenQuestion, qid)
+    if not oq or oq.asker_id != user.id:
+        raise HTTPException(404, "質問が見つかりません")
+    oq.status = "closed"
+    db.commit()
+    return {"ok": True}
 
 
 @app.get("/api/people/{pid}/profile")
@@ -511,6 +579,32 @@ def get_request(rid: int, user: Person = Depends(current_user), db: Session = De
 
 @app.post("/api/requests", status_code=201)
 def create_request(body: RequestIn, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    return _create_request(db, user, body)
+
+
+@app.post("/api/requests/quick", status_code=201)
+def quick_request(body: QuickIn, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    """5分相談をお願いする：日時の候補（相手の出社日を優先）と依頼文を作って、そのまま送る。"""
+    expert = db.get(Person, body.expert_id)
+    if not expert:
+        raise HTTPException(404, "相手が見つかりません")
+    slots = [s.model_dump() for s in body.slots] if body.slots else kw.quick_slots(db, svc.Ctx(db, user), expert.id, 5)
+    purpose = (body.q or "").strip() or f"{body.topic}について聞きたい"
+    msg = (f"{expert.name}さん\n\n{body.topic}について、5分だけ教えていただけないでしょうか。\n知りたいこと：{purpose}\n"
+           "候補の日時から選んでいただければ、近くの席を取って伺います。")
+    return _create_request(db, user, RequestIn(expert_id=expert.id, topic=body.topic, purpose=purpose[:300], viewpoint="まずは5分だけ",
+                                               message=msg, slots=[SlotIn(**s) for s in slots], duration=5))
+
+
+@app.get("/api/requests/quick/slots")
+def quick_slot_suggestions(expert_id: str, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    """5分相談の日時の候補（相手の出社日を優先）。画面で選び直してから送れる。"""
+    if not db.get(Person, expert_id):
+        raise HTTPException(404, "相手が見つかりません")
+    return {"slots": kw.quick_slots(db, svc.Ctx(db, user), expert_id, 5)}
+
+
+def _create_request(db: Session, user: Person, body: RequestIn) -> dict:
     if body.expert_id == user.id:
         raise HTTPException(422, "自分には依頼できません")
     if not db.get(Person, body.expert_id):
@@ -550,7 +644,36 @@ def accept_request(rid: int, body: AcceptIn, user: Person = Depends(current_user
     r.status, r.mode, r.day, r.start, r.responded_at = "accepted", body.mode, date.fromisoformat(s["day"]), s["start"], datetime.now(timezone.utc)
     svc.audit(db, user, "request.accept", f"request:{r.id}", day=s["day"], start=s["start"], mode=body.mode)
     db.commit()
+    if r.mode == "office":
+        _auto_seat(db, r)
     return _view(db, r, user)
+
+
+def _auto_seat(db: Session, r: ConsultationRequest) -> None:
+    """承諾と同時に、依頼した人の席を相手の近くに確保する（相談の時間を含む30分以上）。取れなければ、あとで本人が選ぶ。"""
+    asker = db.get(Person, r.asker_id)
+    if db.scalar(select(Reservation.id).where(Reservation.person_id == asker.id, Reservation.day == r.day)):
+        return  # その日はもう席を取っている
+    ctx = svc.Ctx(db, asker)
+    ex = kw.find_seat_of(db, ctx, r.expert_id, r.day)
+    if not ex:
+        return
+    for seat in kw.nearby_seats(db, ctx, asker, ex, r.day):
+        h, m = map(int, r.start.split(":"))
+        t0 = h * 60 + m - m % 30
+        t1 = min(settings.close_hour * 60, t0 + max(30, ((r.duration + m % 30 + 29) // 30) * 30))
+        body = ReservationIn(seat_id=seat["id"], day=r.day.isoformat(), all_day=False, start=f"{t0 // 60:02d}:{t0 % 60:02d}", end=f"{t1 // 60:02d}:{t1 % 60:02d}",
+                             purpose=f"{r.topic}の相談"[:100], near_person_id=r.expert_id)
+        try:
+            res = _save_reservation(db, asker, body, None)
+        except HTTPException:
+            db.rollback()
+            continue
+        r = db.get(ConsultationRequest, r.id)
+        r.reservation_id = res.id
+        svc.audit(db, asker, "request.autoseat", f"request:{r.id}", seat=seat["id"])
+        db.commit()
+        return
 
 
 @app.post("/api/requests/{rid}/decline")
@@ -644,8 +767,12 @@ def finish_request(rid: int, body: FinishIn, user: Person = Depends(current_user
     r.status, r.ended_at = "done", datetime.now(timezone.utc)
     if user.id == r.asker_id and body.helpful is not None:
         r.helpful = body.helpful
+    note = (body.note or "").strip()
+    if note and not db.scalar(select(ConsultationMemo.id).where(ConsultationMemo.request_id == r.id)):
+        # 一言メモ：受けた人が承認するまで公開しない（NF-11）
+        db.add(ConsultationMemo(request_id=r.id, author_id=user.id, heard=r.purpose, learned=note, reuse=""))
     kw.record_consultation(db, r)
-    svc.audit(db, user, "request.finish", f"request:{r.id}")
+    svc.audit(db, user, "request.finish", f"request:{r.id}", note=bool(note))
     db.commit()
     return _view(db, r, user)
 
@@ -670,6 +797,62 @@ def save_memo(rid: int, body: MemoIn, user: Person = Depends(current_user), db: 
     svc.audit(db, user, "memo.save", f"request:{r.id}")
     db.commit()
     return _view(db, r, user)
+
+
+# ---------- 相談につける資料 ----------
+@app.post("/api/requests/{rid}/attachments", status_code=201)
+def add_attachment(rid: int, body: AttachmentIn, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    r = _request(db, rid, user)
+    if r.status in ("declined", "cancelled"):
+        raise HTTPException(409, "この相談には資料を追加できません")
+    name = os.path.basename(body.filename.replace("\\", "/")).strip()[:200] or "資料"
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext not in ATTACH_TYPES:
+        raise HTTPException(422, "PDF・Word・Excel・PowerPoint・画像・テキスト・CSV のファイルを選んでください")
+    try:
+        data = base64.b64decode(body.data, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(422, "ファイルを読み込めませんでした")
+    if not data:
+        raise HTTPException(422, "空のファイルは添付できません")
+    if len(data) > ATTACH_MAX:
+        raise HTTPException(413, "1つのファイルは10MBまでです")
+    if db.scalar(select(func.count(Attachment.id)).where(Attachment.request_id == r.id)) >= ATTACH_COUNT:
+        raise HTTPException(409, f"資料は1つの相談に{ATTACH_COUNT}つまでです")
+    a = Attachment(request_id=r.id, uploader_id=user.id, filename=name, content_type=ATTACH_TYPES[ext], size=len(data), data=data)
+    db.add(a)
+    db.flush()
+    svc.audit(db, user, "attachment.add", f"request:{r.id}", attachment=a.id, size=len(data))
+    db.commit()
+    return kw.attachment_view(svc.Ctx(db, user), a)
+
+
+def _attachment(db: Session, aid: int, user: Person) -> Attachment:
+    a = db.get(Attachment, aid)
+    if not a:
+        raise HTTPException(404, "資料が見つかりません")
+    _request(db, a.request_id, user)  # 当事者でなければ 404
+    return a
+
+
+@app.get("/api/attachments/{aid}")
+def get_attachment(aid: int, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    a = _attachment(db, aid, user)
+    svc.audit(db, user, "attachment.download", f"attachment:{a.id}")
+    db.commit()
+    return Response(content=a.data, media_type=a.content_type, headers={
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quote(a.filename)}", "Cache-Control": "no-store"})
+
+
+@app.delete("/api/attachments/{aid}")
+def delete_attachment(aid: int, user: Person = Depends(current_user), db: Session = Depends(get_db)):
+    a = _attachment(db, aid, user)
+    if a.uploader_id != user.id:
+        raise HTTPException(403, "資料を消せるのは、つけた人だけです")
+    svc.audit(db, user, "attachment.delete", f"attachment:{a.id}")
+    db.delete(a)
+    db.commit()
+    return {"ok": True}
 
 
 @app.post("/api/requests/{rid}/memo/approve")

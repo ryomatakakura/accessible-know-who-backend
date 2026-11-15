@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 from . import seed_data as S
 from .config import settings
 from .db import Base, SessionLocal, engine
-from .models import (AuditLog, Consultation, ConsultationMemo, ConsultationRequest, Department, Expertise, Floor, Person, Preference, Presence,
+from .models import (Attachment, AuditLog, Consultation, ConsultationMemo, ConsultationRequest, Department, Expertise, Floor, Person, Preference, Presence,
                      Reservation, Room, RoomBooking, Seat)
 from .timeutil import today
 
@@ -65,7 +65,7 @@ def _insert_dynamic(db):
 
 
 # 日付に合わせて作り直すもの（消す順。メモ → 依頼 の順に消す）
-DAILY = (ConsultationMemo, ConsultationRequest, Presence, Reservation, RoomBooking, Consultation)
+DAILY = (Attachment, ConsultationMemo, ConsultationRequest, Presence, Reservation, RoomBooking, Consultation)
 
 
 def init_db(seed: bool = True) -> None:

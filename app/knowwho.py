@@ -3,6 +3,7 @@
 FR-01〜04：推薦（理由・相談適性・接点・出社予定）
 FR-05〜11：相談の依頼・受諾・近くの席・当日・メモとナレッジ還元
 """
+import re
 from collections import Counter, defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from math import hypot
@@ -12,10 +13,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .config import settings
-from .models import AuditLog, Consultation, ConsultationMemo, ConsultationRequest, Expertise, Person, Presence, Reservation
-from .seed_data import STATUSES, match_topics
+from .models import Attachment, AuditLog, Consultation, ConsultationMemo, ConsultationRequest, Expertise, OpenQuestion, Person, Presence, Reservation
+from .seed_data import STATUSES, TOPICS, match_topics, related_topics
 from .services import Ctx, dist_label, floor_state, presences
-from .timeutil import aware, today
+from .timeutil import aware, hhmm_now, today
 
 LIMIT = 5             # 推薦は最大5名（FR-01）
 NEAR_RADIUS = 640     # 近くの席は相手から半径10席以内（1席 ≒ 64）（FR-08）
@@ -170,11 +171,107 @@ def knowledge(db: Session, ctx: Ctx, topics: list[str] | None = None, expert_id:
     return [knowledge_view(ctx, m, r) for m, r in db.execute(q.limit(limit))]
 
 
+def grams(s: str) -> set[str]:
+    t = re.sub(r"[\s　、。・,.!?！？「」（）()]", "", (s or "").lower())
+    return {t[i:i + 2] for i in range(len(t) - 1)}
+
+
+STOP = grams("について知りたいどこまでのことを教えてくださいほしい")  # 質問の言い回しは比べない
+
+
+def closeness(q: str, text: str) -> int:
+    return len((grams(q) - STOP) & grams(text))
+
+
+def near_topics(q: str, topics: list[str]) -> list[str]:
+    """当てはまる分野がないときは、言葉の近い分野。あるときは、同じ部署でよく扱われる分野。"""
+    if topics:
+        out = []
+        for t in topics:
+            out += [x for x in related_topics(t) if x not in topics and x not in out]
+        return out[:3]
+    scored = sorted(((closeness(q, t + "".join(words)), t) for t, words in TOPICS.items()), reverse=True)
+    return [t for sc, t in scored if sc >= 1][:2]
+
+
+def near_people(db: Session, ctx: Ctx, topics: list[str], near: list[str], me: Person, limit: int = 4) -> list[dict]:
+    """詳しい人が見つからないときの受け皿：接点をたどって、その分野に近い人。
+    推薦の対象外にしている人の名前は出さない（部署だけを手がかりにする）。"""
+    out, seen = [], {me.id}
+
+    def add(pid, why, topic):
+        if pid in seen or pid not in ctx.people or not ctx.pref(pid)["opt_in"] or len(out) >= limit:
+            return
+        seen.add(pid)
+        out.append({"person": ctx.person(pid), "why": why, "topic": topic})
+    # 1. 以前この分野を相談して解決した人
+    for c in db.scalars(select(Consultation).where(Consultation.topic.in_(topics or ["-"]), Consultation.resolved.is_(True)).order_by(Consultation.day.desc())):
+        add(c.asker_id, f"以前「{c.topic}」を相談して解決した人", c.topic)
+    # 2. 詳しい人がいる部署の人（取り次いでもらえるかも）
+    for t in topics:
+        for pid, sk in ctx.skills.items():
+            if t in sk and pid in ctx.people:
+                dept = ctx.people[pid].dept_id
+                for other in sorted(ctx.people):
+                    if ctx.people[other].dept_id == dept and t not in ctx.skills.get(other, {}):
+                        add(other, f"{ctx.depts.get(dept, '')}の人。同じ部署に「{t}」に詳しい人がいます", t)
+                        break
+    # 3. 近い分野に詳しい人
+    for t in near:
+        for e in candidates(db, ctx, [t], me, exclude=seen, limit=2):
+            add(e["person"]["id"], f"近い分野「{t}」に詳しい", t)
+    return out
+
+
+def text_knowledge(db: Session, ctx: Ctx, q: str, exclude: set[int], limit: int = 5) -> list[dict]:
+    """テーマに当てはまらなくても、メモの本文が近ければ出す。"""
+    rows = db.execute(select(ConsultationMemo, ConsultationRequest).join(ConsultationRequest, ConsultationMemo.request_id == ConsultationRequest.id)
+                      .where(ConsultationMemo.status == "approved"))
+    scored = []
+    for m, r in rows:
+        if m.id in exclude:
+            continue
+        sc = closeness(q, " ".join([r.topic, r.viewpoint, r.purpose, m.heard, m.learned, m.reuse]))
+        if sc >= 2:
+            scored.append((sc, m.id, m, r))
+    scored.sort(key=lambda t: (-t[0], -t[1]))
+    return [knowledge_view(ctx, m, r) for _, _, m, r in scored[:limit]]
+
+
 def search(db: Session, ctx: Ctx, q: str, me: Person) -> dict:
     topics = match_topics(q)
-    if not topics:
-        return {"q": q, "topics": [], "candidates": [], "knowledge": []}
-    return {"q": q, "topics": topics, "candidates": candidates(db, ctx, topics, me), "knowledge": knowledge(db, ctx, topics)}
+    if not q:
+        return {"q": q, "topics": [], "candidates": [], "knowledge": [], "near": [], "near_topics": []}
+    cands = candidates(db, ctx, topics, me) if topics else []
+    kn = knowledge(db, ctx, topics) if topics else []
+    if len(kn) < 5:  # 先に聞いた人のメモは、言葉が近いものも出す
+        kn += text_knowledge(db, ctx, q, {k["id"] for k in kn}, 5 - len(kn))
+    nt = near_topics(q, topics)
+    near = near_people(db, ctx, topics, nt, me) if not cands else []
+    return {"q": q, "topics": topics, "candidates": cands, "knowledge": kn, "near": near, "near_topics": nt}
+
+
+def quick_slots(db: Session, ctx: Ctx, expert_id: str, minutes: int) -> list[dict]:
+    """5分相談の希望日時：相手が出社する日を先に。今日なら少し先の時間、ほかの日は 10:00 / 13:30 / 16:00。"""
+    sched = Schedules(db, ctx)
+    week = sched.week(expert_id)
+    office = [date.fromisoformat(d["day"]) for d in week["days"] if d["status"] == "office"]
+    days = list(dict.fromkeys(office + [d for d in weekdays_from(today() + timedelta(days=1), 5)]))
+    times, out = ["10:00", "13:30", "16:00"], []
+    lo, hi = settings.open_hour * 60, settings.close_hour * 60
+    for d in days:
+        if d == today():
+            h, m = map(int, hhmm_now().split(":"))
+            t = ((h * 60 + m + 20) // 30 + 1) * 30
+            if t < lo or t + minutes > hi - 60:
+                continue
+            start = f"{t // 60:02d}:{t % 60:02d}"
+        else:
+            start = times[len(out) % 3]
+        out.append({"day": d.isoformat(), "start": start})
+        if len(out) == 3:
+            break
+    return out
 
 
 def profile(db: Session, ctx: Ctx, pid: str, me: Person) -> dict:
@@ -233,6 +330,7 @@ def request_view(db: Session, ctx: Ctx, r: ConsultationRequest, me: Person, full
          "ends_at": (started + timedelta(minutes=r.duration)).isoformat() if started else None,
          "overdue": r.status == "pending" and now - created > timedelta(hours=REMIND_HOURS),
          "is_today": r.day == today(), "step": step_of(r, memo), "helpful": r.helpful,
+         "attachments": [attachment_view(ctx, a) for a in db.scalars(select(Attachment).where(Attachment.request_id == r.id).order_by(Attachment.id))],
          "memo": {"heard": memo.heard, "learned": memo.learned, "reuse": memo.reuse, "status": memo.status, "author": ctx.person(memo.author_id),
                   "approved_at": aware(memo.approved_at).isoformat() if memo.approved_at else None} if memo else None}
     if not full:
@@ -256,6 +354,11 @@ def request_view(db: Session, ctx: Ctx, r: ConsultationRequest, me: Person, full
     return v
 
 
+def attachment_view(ctx: Ctx, a: Attachment) -> dict:
+    return {"id": a.id, "filename": a.filename, "content_type": a.content_type, "size": a.size, "uploader": ctx.person(a.uploader_id),
+            "created_at": aware(a.created_at).isoformat()}
+
+
 def record_consultation(db: Session, r: ConsultationRequest) -> None:
     """相談が実施されたら、Know-Who の「頼られた」に数える。"""
     d = r.day or today()
@@ -272,8 +375,35 @@ def learn_topic(db: Session, r: ConsultationRequest) -> bool:
     return True
 
 
+def question_match(db: Session, ctx: Ctx, oq: OpenQuestion, me: Person) -> str | None:
+    """置いておいた質問に、いま答えられそうな人（推薦の対象になっている人）。"""
+    topics = match_topics(oq.q)
+    if topics:
+        c = candidates(db, ctx, topics, me, limit=1)
+        if c:
+            return c[0]["person"]["id"]
+    for pid, sk in ctx.skills.items():  # 相談から新しく加わった分野も見る
+        if pid != me.id and pid in ctx.people and ctx.pref(pid)["opt_in"] and any(closeness(oq.q, t) >= 2 for t in sk):
+            return pid
+    return None
+
+
+def check_questions(db: Session, ctx: Ctx, me: Person) -> None:
+    for oq in db.scalars(select(OpenQuestion).where(OpenQuestion.asker_id == me.id, OpenQuestion.status == "open")):
+        pid = question_match(db, ctx, oq, me)
+        if pid:
+            oq.status, oq.found_person_id, oq.found_at = "found", pid, datetime.now(timezone.utc)
+    db.commit()
+
+
+def question_view(ctx: Ctx, oq: OpenQuestion) -> dict:
+    return {"id": oq.id, "q": oq.q, "status": oq.status, "created_at": aware(oq.created_at).isoformat(),
+            "found": ctx.person(oq.found_person_id) if oq.found_person_id in ctx.people else None}
+
+
 def inbox(db: Session, ctx: Ctx, me: Person) -> dict:
     """対応が必要なもの（画面の通知バッジ）。"""
+    check_questions(db, ctx, me)
     rows = list(db.scalars(select(ConsultationRequest).where((ConsultationRequest.asker_id == me.id) | (ConsultationRequest.expert_id == me.id))))
     memos = {m.request_id: m for m in db.scalars(select(ConsultationMemo).where(ConsultationMemo.request_id.in_([r.id for r in rows] or [-1])))}
     todo = []
@@ -289,7 +419,9 @@ def inbox(db: Session, ctx: Ctx, me: Person) -> dict:
             todo.append(("approve", r.id))
         elif r.status == "accepted" and r.day == today() and not r.started_at:
             todo.append(("today", r.id))
-    return {"count": len(todo), "items": [{"kind": k, "id": i} for k, i in todo]}
+    found = [question_view(ctx, q) for q in db.scalars(select(OpenQuestion).where(OpenQuestion.asker_id == me.id, OpenQuestion.status == "found"))]
+    items = [{"kind": k, "id": i} for k, i in todo] + [{"kind": "found", "id": q["id"], "question": q} for q in found]
+    return {"count": len(items), "items": items}
 
 
 def cycle(db: Session, days: int) -> dict:
@@ -319,4 +451,19 @@ def cycle(db: Session, days: int) -> dict:
         "h6_burden": pct(sum(1 for r in declined if r.decline_reason == BURDEN), len(declined)),
         "targets": {"h1": 30, "h2": 60, "h3": 70, "h4": 40, "h5": 20, "h6": 50, "h6_burden": 20},
         "decline_reasons": [{"reason": k, "n": n} for k, n in Counter(r.decline_reason or "理由なし" for r in declined).most_common()],
+        "gaps": gaps(db, since),
     }
+
+
+def gaps(db: Session, since: datetime) -> dict:
+    """知識の空白：詳しい人が見つからなかった検索と、置かれたままの質問。"""
+    rows = [a for a in db.scalars(select(AuditLog).where(AuditLog.action == "knowwho.gap")) if aware(a.at) >= since]
+    cnt, topics = Counter(), {}
+    for a in rows:
+        q = (a.detail or {}).get("q", "")
+        cnt[q] += 1
+        topics[q] = (a.detail or {}).get("topics", [])
+    open_q = list(db.scalars(select(OpenQuestion).where(OpenQuestion.status == "open")))
+    return {"searches": len(rows), "open_questions": len(open_q),
+            "top": [{"q": q, "n": n, "topics": topics[q]} for q, n in cnt.most_common(8)],
+            "questions": [{"q": o.q, "since": aware(o.created_at).isoformat()} for o in sorted(open_q, key=lambda o: o.created_at, reverse=True)[:8]]}

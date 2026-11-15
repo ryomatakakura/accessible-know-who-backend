@@ -125,6 +125,15 @@ _DEMO_TOPICS = {"u01": ["非対面サービスの審査", "コンプライアン
                 "u10": ["非対面サービスの審査"], "u40": ["補助金申請"], "u35": ["生成AI活用"], "u17": ["研修設計"]}
 
 
+def related_topics(topic: str) -> list[str]:
+    """同じ部署でよく扱われる分野を「近い分野」とみなす。"""
+    out = []
+    for ts in _DEPT_TOPICS.values():
+        if topic in ts:
+            out += [t for t in ts if t != topic and t not in out]
+    return out
+
+
 def match_topics(text: str) -> list[str]:
     """「今日やること」の文から、当てはまる分野を最大3つ選ぶ。"""
     t = (text or "").replace(" ", "").replace("　", "").lower()

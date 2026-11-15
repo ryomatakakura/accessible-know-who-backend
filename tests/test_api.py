@@ -355,19 +355,20 @@ def test_request_accept_seat_start_memo_and_knowledge(c):
     assert v["status"] == "accepted" and v["day"] == str(t) and v["end"] == "20:30"
     assert c.post(f"/api/requests/{rid}/accept", json={"slot": 0}, headers=as_("u01")).status_code == 409
     v = c.get(f"/api/requests/{rid}", headers=as_("u00")).json()
-    assert v["step"] == 3 and v["expert_seat"] and v["nearby"] and len(v["nearby"]) <= 3
-    assert all(s["dist"] <= 640 for s in v["nearby"])  # 相手から半径10席以内
-    seat = v["nearby"][0]["id"]
-    v = c.post(f"/api/requests/{rid}/seat", json={"seat_id": seat}, headers=as_("u00")).json()
-    assert v["asker_seat"]["id"] == seat and v["step"] == 4
+    # 承諾と同時に、相手の近くの空席が依頼者の名前で取れている（相談の時間を含む30分）
+    assert v["step"] == 4 and v["expert_seat"] and v["asker_seat"]
+    ex, me_seat = v["expert_seat"], v["asker_seat"]
+    assert ex["floor"] == me_seat["floor"] and ((ex["x"] - me_seat["x"]) ** 2 + (ex["y"] - me_seat["y"]) ** 2) ** 0.5 <= 640
     mine = c.get("/api/reservations/mine", headers=as_("u00")).json()["reservations"]
-    assert any(x["seat"]["id"] == seat and x["near"]["id"] == "u01" for x in mine)
+    auto = next(x for x in mine if x["seat"]["id"] == me_seat["id"])
+    assert auto["near"]["id"] == "u01" and not auto["all_day"] and auto["start"] == "20:00" and auto["end"] == "20:30"
+    seat = me_seat["id"]
     v = c.post(f"/api/requests/{rid}/start", json={}, headers=as_("u00")).json()
     assert v["started_at"] and v["ends_at"] and v["step"] == 5
     st = c.get(f"/api/state?floor={seat[:3]}", headers=as_("u00")).json()
     assert st["me"]["location"]["status"] == "office" and st["me"]["location"]["seat"]["id"] == seat  # 相談の開始と一緒にチェックイン
     memo = {"heard": "eKYCでどこまで省けたか", "learned": "上限額と追加確認で例外を認めた", "reuse": "先にリスク管理部と事前協議する", "helpful": True}
-    assert c.put(f"/api/requests/{rid}/memo", json={**memo, "reuse": " "}, headers=as_("u00")).status_code == 422
+    assert c.put(f"/api/requests/{rid}/memo", json={**memo, "learned": " "}, headers=as_("u00")).status_code == 422
     v = c.put(f"/api/requests/{rid}/memo", json=memo, headers=as_("u00")).json()
     assert v["status"] == "done" and v["memo"]["status"] == "pending" and v["helpful"] is True
     # 承認されるまで公開しない
@@ -395,15 +396,13 @@ def test_request_decline_offers_alternatives_and_cancel_frees_seat(c):
     assert 1 <= len(alt) <= 2 and "u18" not in alt  # 代わりの詳しい人を1名以上
     rid = c.post("/api/requests", json=request_body(t), headers=as_("u00")).json()["id"]
     c.post(f"/api/requests/{rid}/accept", json={"slot": 0}, headers=as_("u01"))
-    seat = c.get(f"/api/requests/{rid}", headers=as_("u00")).json()["nearby"][0]["id"]
-    c.post(f"/api/requests/{rid}/seat", json={"seat_id": seat}, headers=as_("u00"))
+    seat = c.get(f"/api/requests/{rid}", headers=as_("u00")).json()["asker_seat"]["id"]
     assert c.post(f"/api/requests/{rid}/cancel", headers=as_("u00")).json()["status"] == "cancelled"
     assert not any(x["seat"]["id"] == seat for x in c.get("/api/reservations/mine", headers=as_("u00")).json()["reservations"])
     # 出社日が合わないときはオンラインへ。取った席は空ける
     rid = c.post("/api/requests", json=request_body(t), headers=as_("u00")).json()["id"]
     c.post(f"/api/requests/{rid}/accept", json={"slot": 0}, headers=as_("u01"))
-    seat = c.get(f"/api/requests/{rid}", headers=as_("u00")).json()["nearby"][0]["id"]
-    c.post(f"/api/requests/{rid}/seat", json={"seat_id": seat}, headers=as_("u00"))
+    seat = c.get(f"/api/requests/{rid}", headers=as_("u00")).json()["asker_seat"]["id"]
     v = c.post(f"/api/requests/{rid}/online", headers=as_("u01")).json()
     assert v["mode"] == "online" and v["step"] == 4
     assert not any(x["seat"]["id"] == seat for x in c.get("/api/reservations/mine", headers=as_("u00")).json()["reservations"])
@@ -421,3 +420,93 @@ def test_online_start_and_demo_inbox(c):
     assert kinds.count("respond") == 2 and "approve" in kinds and "memo" in kinds  # デモの利用者がすぐ試せる
     received = c.get("/api/requests", headers=as_("u00")).json()["received"]
     assert any(x["overdue"] for x in received)  # 48時間返事がない依頼
+
+
+
+# ---------- 5分相談・候補ゼロの受け皿・一言メモ ----------
+def test_quick_five_minute_request(c):
+    r = c.post("/api/requests/quick", json={"expert_id": "u10", "topic": "非対面サービスの審査", "q": "eKYCの判断基準"}, headers=as_("u00"))
+    assert r.status_code == 201, r.text
+    v = r.json()
+    assert v["duration"] == 5 and v["purpose"] == "eKYCの判断基準" and 1 <= len(v["slots"]) <= 3
+    office = [d["day"] for d in c.get("/api/people/u10/profile", headers=as_("u00")).json()["schedule"]["days"] if d["status"] == "office"]
+    assert office and v["slots"][0]["day"] == office[0]  # 相手が出社する日を先に出す
+    sug = c.get("/api/requests/quick/slots?expert_id=u10", headers=as_("u00")).json()["slots"]
+    assert sug == [{"day": x["day"], "start": x["start"]} for x in v["slots"]]  # 画面に出す候補と、自動で送る候補は同じ
+    d = str(today(c) + timedelta(days=2))
+    v = c.post("/api/requests/quick", json={"expert_id": "u18", "topic": "セキュリティ審査", "slots": [{"day": d, "start": "15:30"}]}, headers=as_("u00")).json()
+    assert [(x["day"], x["start"], x["end"]) for x in v["slots"]] == [(d, "15:30", "15:35")]  # 選んだ日時で送れる
+    bad = {"expert_id": "u18", "topic": "x", "slots": [{"day": str(today(c) - timedelta(days=1)), "start": "10:00"}]}
+    assert c.post("/api/requests/quick", json=bad, headers=as_("u00")).status_code == 422
+    assert c.get("/api/requests/quick/slots?expert_id=nobody", headers=as_("u00")).status_code == 404
+    assert c.post("/api/requests/quick", json={"expert_id": "u00", "topic": "x"}, headers=as_("u00")).status_code == 422
+    assert c.post("/api/requests/quick", json={"expert_id": "nobody", "topic": "x"}, headers=as_("u00")).status_code == 404
+
+
+def test_zero_candidates_offer_near_people_question_and_gap(c):
+    out = {}
+    for _ in range(6):  # 「非対面サービスの審査」に詳しい人を全員、推薦の対象外にする
+        r = c.get("/api/knowwho?q=非対面サービスの審査", headers=as_("u00")).json()
+        if not r["candidates"]:
+            break
+        for e in r["candidates"]:
+            out[e["person"]["id"]] = e["person"]["name"]
+            c.put("/api/prefs", json={"opt_in": False, "scope": "all"}, headers=as_(e["person"]["id"]))
+    assert "u18" in out and r["candidates"] == [] and r["near"]
+    assert not {n["person"]["id"] for n in r["near"]} & (set(out) | {"u00"})  # 対象外の人と自分は出さない
+    assert all(n["why"] and not any(name in n["why"] for name in out.values()) for n in r["near"])  # 対象外の人の名前は出さない
+    q = c.post("/api/questions", json={"q": "非対面サービスの審査で本人確認をどこまで省けるか"}, headers=as_("u00")).json()
+    assert q["status"] == "open"
+    assert c.post("/api/questions", json={"q": "  "}, headers=as_("u00")).status_code == 422
+    gaps = c.get("/api/analytics", headers=as_("u00")).json()["cycle"]["gaps"]
+    assert gaps["searches"] >= 1 and gaps["open_questions"] == 1 and gaps["top"][0]["q"] == "非対面サービスの審査"
+    c.put("/api/prefs", json={"opt_in": True, "scope": "all"}, headers=as_("u18"))  # 詳しい人が現れた
+    items = c.get("/api/inbox", headers=as_("u00")).json()["items"]
+    found = next(i for i in items if i["kind"] == "found")
+    assert found["question"]["found"]["id"] == "u18"
+    assert c.post(f"/api/questions/{found['id']}/close", headers=as_("u00")).json()["ok"]
+    assert all(i["kind"] != "found" for i in c.get("/api/inbox", headers=as_("u00")).json()["items"])
+    assert c.post(f"/api/questions/{found['id']}/close", headers=as_("u05")).status_code == 404
+
+
+def test_one_line_memo_shows_before_people(c):
+    t = today(c)
+    rid = c.post("/api/requests", json=request_body(t, slots=[{"day": str(t), "start": "20:00"}]), headers=as_("u00")).json()["id"]
+    c.post(f"/api/requests/{rid}/accept", json={"slot": 0, "mode": "online"}, headers=as_("u01"))
+    c.post(f"/api/requests/{rid}/start", json={}, headers=as_("u00"))
+    v = c.post(f"/api/requests/{rid}/finish", json={"helpful": True, "note": "金額の上限を決めれば、本人確認書類は1点で通った"}, headers=as_("u00")).json()
+    assert v["status"] == "done" and v["memo"]["learned"] == "金額の上限を決めれば、本人確認書類は1点で通った" and v["memo"]["status"] == "pending"
+    v = c.post(f"/api/requests/{rid}/memo/approve", headers=as_("u01")).json()
+    assert v["memo"]["status"] == "approved"
+    # テーマに当てはまらない言葉でも、メモの本文が近ければ出る
+    kn = c.get("/api/knowwho?q=本人確認書類は何点必要？", headers=as_("u05")).json()["knowledge"]
+    assert any(k["learned"].startswith("金額の上限を決めれば") for k in kn)
+
+
+
+def test_request_attachments(c):
+    import base64
+    t = today(c)
+    rid = c.post("/api/requests", json=request_body(t + timedelta(days=1)), headers=as_("u00")).json()["id"]
+    pdf = b"%PDF-1.4 demo"
+    up = c.post(f"/api/requests/{rid}/attachments", json={"filename": "企画書（案）.pdf", "data": base64.b64encode(pdf).decode()}, headers=as_("u00"))
+    assert up.status_code == 201, up.text
+    a = up.json()
+    assert a["filename"] == "企画書（案）.pdf" and a["size"] == len(pdf) and a["content_type"] == "application/pdf"
+    v = c.get(f"/api/requests/{rid}", headers=as_("u01")).json()  # 相手にも見える
+    assert [x["id"] for x in v["attachments"]] == [a["id"]]
+    d = c.get(f"/api/attachments/{a['id']}", headers=as_("u01"))
+    assert d.status_code == 200 and d.content == pdf and "attachment" in d.headers["content-disposition"]
+    assert c.get(f"/api/attachments/{a['id']}", headers=as_("u05")).status_code == 404  # 当事者だけ
+    b64 = lambda b: base64.b64encode(b).decode()  # noqa: E731
+    assert c.post(f"/api/requests/{rid}/attachments", json={"filename": "run.exe", "data": b64(b"MZ")}, headers=as_("u00")).status_code == 422
+    assert c.post(f"/api/requests/{rid}/attachments", json={"filename": "a.pdf", "data": "%%%"}, headers=as_("u00")).status_code == 422
+    big = b64(b"0" * (10 * 1024 * 1024 + 1))
+    assert c.post(f"/api/requests/{rid}/attachments", json={"filename": "big.pdf", "data": big}, headers=as_("u00")).status_code == 413
+    for i in range(4):
+        assert c.post(f"/api/requests/{rid}/attachments", json={"filename": f"m{i}.png", "data": b64(b"png")}, headers=as_("u01")).status_code == 201
+    assert c.post(f"/api/requests/{rid}/attachments", json={"filename": "x.txt", "data": b64(b"x")}, headers=as_("u00")).status_code == 409  # 5つまで
+    assert c.delete(f"/api/attachments/{a['id']}", headers=as_("u01")).status_code == 403  # 消せるのはつけた人
+    assert c.delete(f"/api/attachments/{a['id']}", headers=as_("u00")).json()["ok"]
+    assert len(c.get(f"/api/requests/{rid}", headers=as_("u00")).json()["attachments"]) == 4
+    assert c.post("/api/admin/reset").status_code == 200  # デモを戻しても資料が残って詰まらない
